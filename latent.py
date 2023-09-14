@@ -53,62 +53,103 @@ class LatentLM:
         else:
             assert False, "Cannot embed input_ids for model '{}'. Please set the 'input_id_embedding_module' ({}) property to the name of the module that embeds input_ids.".format(self.model_name, self.input_id_embedding_module)
 
-    def embed(self, prompt: Union[List[Union[str, torch.Tensor]], str]) -> torch.Tensor:
-        if type(prompt) is str:
-            prompt = [prompt]
+    def consolidate_prompt(self, prompt):
+        if type(prompt) is list:
+            r = []
+            for s in prompt:
+                if len(r) > 0 and type(s) is str and type(r[-1]) is str:
+                    r[-1] += s
+                else:
+                    r += [s]
+            return r
+        else:
+            return prompt
 
+    def broadcast(self, prompt):
+        shapes = list(set([len(s) if type(s) is list else 1 for s in prompt]))
+        
+        if len(shapes) == 1:
+            if shapes[0] == 1:
+                # all segments are singular
+                return [[self.consolidate_prompt(prompt)]]
+            else:
+                # pair all segments index-wise
+                return zip(*[prompt])
+        elif len(shapes) == 2:
+            assert shapes[0] == 1 or shapes[1] == 1, "Cannot broadcast prompt segments of shape {}".format(shapes)
+            non_singular = shapes[0] if shapes[0] != 1 else shapes[1]
+            pairings = []
+            for i in range(non_singular):
+                pairing = []
+                for segment in prompt:
+                    if type(segment) is list:
+                        pairing += [segment[i]]
+                    else:
+                        pairing += [segment]
+                pairings += [self.consolidate_prompt(pairing)]
+            return pairings
+        else:
+            assert False, "Cannot broadcast prompt segments of shape {}".format(shapes)
+        
+
+    def embed(self, prompt: Union[List[Union[str, torch.Tensor]], str]) -> torch.Tensor:
         inputs_embeds = []
         text = ""
         offset_mapping = []
         input_ids = []
+        first = True
 
         for segment in prompt:
             if type(segment) is str:
                 segment_text = segment
-                encoded_inputs = self.tokenizer(segment_text, return_tensors='pt', return_offsets_mapping=True, add_special_tokens=False)
-                offset_mapping += torch.cat([torch.tensor([[len(text),len(text)]], dtype=torch.int64), encoded_inputs['offset_mapping'][0] + len(text)])
                 text += segment_text
-                segment_ids = [self.tokenizer.bos_token_id] + encoded_inputs['input_ids'].flatten().tolist()
+                encoded_inputs = self.tokenizer(segment_text, return_tensors='pt', return_offsets_mapping=True, add_special_tokens=False)
+                if first:
+                    offset_mapping += torch.cat([torch.tensor([[len(text),len(text)]], dtype=torch.int64), encoded_inputs['offset_mapping'][0] + len(text)])
+                    segment_ids = [self.tokenizer.bos_token_id] + encoded_inputs['input_ids'].flatten().tolist()
+                else:
+                    offset_mapping += encoded_inputs['offset_mapping'][0] + len(text)
+                    segment_ids = encoded_inputs['input_ids'].flatten().tolist()
                 input_ids += segment_ids
                 segment = self.embed_input_ids(torch.tensor(segment_ids, dtype=torch.int64, device=encoded_inputs['input_ids'].device))
                 inputs_embeds.append(segment)
             elif type(segment) is LatentTensor:
                 latent: LatentTensor = segment
-
-                assert len(latent.shape) < 3, "Cannot embed latents of shape {}. Please provide latents either in shape (sequence_length, hidden_size) or (hidden_size).".format(latent.shape)
+                latent_shp = latent.shape
+                assert len(latent_shp) == 3, "Expected latent of shape (layers,seq_len,hidden_size), but got {}".format(latent_shp)
+                assert latent_shp[0] == 1, "Expected latent of shape (1,seq_len,hidden_size), but got {}".format(latent_shp)
+                seq_len = latent_shp[1]
 
                 offset_begin = len(text)
-                if len(latent.shape) == 2:
-                    latent = latent.copy()
-                    latent.name += "(width={})".format(latent.shape[2])
-
-                latent_repr = f"[{latent.name}]"
+                
+                latent_repr = f"[{latent.names[0]}]"
                 
                 text += latent_repr
-                input_ids += [latent]
+                input_ids += [latent] * seq_len
                 
-                offset_mapping += torch.tensor([[offset_begin, offset_begin + len(latent_repr)]])
-                
-                if len(latent.shape) == 2:
-                    # multi-token latent
-                    inputs_embeds += [latent.hidden_states.unsqueeze(0)]
-                else:
-                    # single-token latent
-                    inputs_embeds += [latent.hidden_states.unsqueeze(0).unsqueeze(0)]
+                offset_mapping += torch.tensor([[offset_begin, offset_begin + len(latent_repr)]] + [[0,0] for _ in range(seq_len - 1)], dtype=torch.int64)
+                inputs_embeds += [latent.hidden_states[0]]
             else:
                 raise ValueError("Expected prompt to be a string or a list of strings and tensors, but got {}".format(type(segment)))
+                
+            first = False
 
-        inputs_embeds = torch.cat(inputs_embeds, dim=1)
+        inputs_embeds = torch.cat(inputs_embeds, dim=0)
         offset_mapping = torch.stack(offset_mapping, dim=0)
         attention_mask = torch.ones(inputs_embeds.shape[:-1], dtype=torch.long)
 
         return inputs_embeds, input_ids, text, offset_mapping, attention_mask
 
     def __call__(self, prompt, last_only=True, name=None, **kwargs):
+        if type(prompt) is str:
+            prompt = [prompt]
+        
         batch_size = len(prompt)
         results = []
         for i in range(batch_size):
-            results += [self.embed(prompt[i])]
+            for p in self.broadcast(prompt[i]):
+                results += [self.embed(p)]
+        batch_size = len(results)
         
         max_len = max([r[0].shape[0] for r in results])
         for i in range(batch_size):
@@ -138,7 +179,7 @@ class LatentLM:
         
         output = self.model(**model_inputs)
         
-        return LatentTensor(output['hidden_states'], text, self, input_ids, offset_mapping, attention_mask, names=name)
+        return LatentTensor(output['hidden_states'], text, self, input_ids, offset_mapping, attention_mask, names=[name for _ in range(batch_size)])
 
 def shape(v):
     if type(v) == list:
@@ -193,7 +234,7 @@ class LatentTensor:
 
         title += ".LatentTensor{} <-> ".format(str(shp))
 
-        prompts = [str([p + "[TOK]"])[1:-1] for p in self.prompts]
+        prompts = [str([p + "[TOK]"])[1:-1] for n,p in zip(self.names, self.prompts)]
         prompts[1:] = [" " * len(title) + p for p in prompts[1:]]
 
         return title + "\n".join(prompts) + "\n"
@@ -303,7 +344,7 @@ class LatentTensor:
         return LatentTensor(hidden_states, self.prompts, self.model, self.input_ids, self.offset_mapping, self.attention_mask, layer_idx=idx)
 
     def copy(self):
-        return LatentTensor(self.hidden_states, self.prompts, self.model, self.input_ids, self.offset_mapping, self.attention_mask, names=self.names)
+        return LatentTensor(self.hidden_states, self.prompts, self.model, self.input_ids, self.offset_mapping, self.attention_mask, names=self.names.copy(), layer_idx=self.layer_idx)
     
     def __getitem__(self, idx):
         return self.token(idx)
@@ -592,7 +633,7 @@ def decode(input_ids, tokenizer, hide_eos=True):
 
     if type(input_ids[0]) is LatentTensor:
         latent = input_ids[0]
-        return f"[{latent.name}]" + decode(input_ids[1:], tokenizer)
+        return f"[{latent.names[0]}]" + decode(input_ids[1:], tokenizer)
 
     i = 0
     while i + 1 < len(input_ids) and type(input_ids[i+1]) is not LatentTensor:
@@ -613,9 +654,9 @@ class LatentModule(torch.nn.Module):
         super().__init__()
 
     def __call__(self, latent: LatentTensor, *args, **kwargs) -> LatentTensor:
-        x = self.forward(latent.hidden_states, *args, **kwargs)
-        name = f"{self.name}({latent.name})"
-        return LatentTensor(x, latent.prompts, latent.model, latent.input_ids, latent.offset_mapping, latent.attention_mask, names=name, layer_idx=latent.layer_idx)
+        x = self.forward(latent.hidden_states[-1], *args, **kwargs)
+        names = [f"{self.name}({n})" for n in latent.names]
+        return LatentTensor(x, latent.prompts, latent.model, latent.input_ids, latent.offset_mapping, latent.attention_mask, names=names, layer_idx=latent.layer_idx)
     
     @staticmethod
     def loss(objective: LatentEqualityObjective, loss_fct="cosine"):
