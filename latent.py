@@ -1,6 +1,7 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import warnings
 import torch
+import random
 from typing import Any, Union, List
 from tqdm import tqdm
 
@@ -154,9 +155,10 @@ class LatentLM:
 
         inputs_embeds = torch.cat(inputs_embeds, dim=0)
         offset_mapping = torch.stack(offset_mapping, dim=0)
-        attention_mask = torch.ones(inputs_embeds.shape[:-1], dtype=torch.long)
+        attention_mask = torch.ones(inputs_embeds.shape[:-1], dtype=torch.long, device=inputs_embeds.device)
+        position_ids = torch.arange(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
 
-        return inputs_embeds, input_ids, text, offset_mapping, attention_mask
+        return inputs_embeds, input_ids, text, offset_mapping, attention_mask, position_ids
 
     def __call__(self, prompt, last_only=True, name=None, **kwargs):
         if type(prompt) is str:
@@ -169,7 +171,7 @@ class LatentLM:
                 results += [self.embed(p)]
         batch_size = len(results)
         
-        max_len = max([r[0].shape[0] for r in results])
+        max_len = max([r[0].shape[0] for r in results]) + 1
         for i in range(batch_size):
             if results[i][0].shape[0] < max_len:
                 # left-pad with zeros
@@ -178,25 +180,29 @@ class LatentLM:
                 pad = torch.zeros(max_len - results[i][0].shape[0], device=results[i][0].device, dtype=torch.int64)
                 padded_attention_mask = torch.cat([pad, results[i][4]], dim=0)
                 # add (0,0) offsets for pad tokens
-                offset_mapping = torch.cat([torch.zeros(max_len - results[i][0].shape[0], 2, device=results[i][0].device, dtype=torch.int32), results[i][3]], dim=0)
+                offset_mapping = torch.cat([torch.zeros(max_len - results[i][0].shape[0], 2, device=results[i][3].device, dtype=torch.int32), results[i][3]], dim=0)
+                
+                padded_position_ids = torch.maximum(torch.arange(max_len, dtype=torch.long, device=results[i][5].device) - (max_len - results[i][0].shape[0]), torch.zeros(max_len, dtype=torch.long, device=results[i][5].device))
 
-                results[i] = (padded_inputs_embeds, padded_input_ids, results[i][2], offset_mapping, padded_attention_mask)
+                results[i] = (padded_inputs_embeds, padded_input_ids, results[i][2], offset_mapping, padded_attention_mask, padded_position_ids)
 
         inputs_embeds = torch.stack([r[0] for r in results], dim=0)
         input_ids = [r[1] for r in results]
         text = [r[2] for r in results]
         offset_mapping = [r[3] for r in results]
         attention_mask = torch.stack([r[4] for r in results], dim=0)
+        position_ids = torch.stack([r[5] for r in results], dim=0)
 
         model_inputs = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
             "output_hidden_states": True,
+            "position_ids": position_ids,
             **kwargs
         }
-        
+
         output = self.model(**model_inputs)
-        
+
         return LatentTensor(output['hidden_states'], text, self, input_ids, offset_mapping, attention_mask, names=[name for _ in range(batch_size)])
 
 def shape(v):
@@ -742,7 +748,9 @@ class LatentModule(torch.nn.Module):
         
         if "cosine" in loss_fct.lower():
             # print shapes
-            loss += 1 - torch.nn.functional.cosine_similarity(objective.latents[0].hidden_states.unsqueeze(0), objective.latents[1].hidden_states.unsqueeze(0)).mean()
+            # loss += 1 - torch.nn.functional.cosine_similarity(objective.latents[0].hidden_states.unsqueeze(0), objective.latents[1].hidden_states.unsqueeze(0)).mean()
+            for l,r in zip(objective.latents[0].hidden_states, objective.latents[1].hidden_states):
+                loss += 1 - torch.nn.functional.cosine_similarity(l.unsqueeze(0), r.unsqueeze(0)).mean()
 
         if "crossentropy" in loss_fct.lower():
             target = objective.latents[1].next().clone().detach()
@@ -750,17 +758,25 @@ class LatentModule(torch.nn.Module):
 
         return loss
 
+    @staticmethod
     def token_match(objective: LatentEqualityObjective, **kwargs):
         assert len(objective.latents) == 2, "Expected exactly 2 latents, but got {}".format(len(objective.latents))
-        return objective.latents[0].next(**kwargs) == objective.latents[1].next(**kwargs)
+        lhs = objective.latents[0].next(**kwargs)
+        rhs = objective.latents[1].next(**kwargs)
+        return lhs == rhs
 
-    def fit(self, objective_fct, samples, loss_fct="cosine", epochs=1, lr=0.01, test=None, batch_size=8, **kwargs):
+    def fit(self, objective_fct, samples, loss_fct="cosine", epochs=1, lr=0.01, test=None, batch_size=8, epoch_callback=None, **kwargs):
         optimizer = torch.optim.Adam(self.parameters(), lr=lr, **kwargs)
         
-        pbar = tqdm(range(epochs*len(samples)//batch_size), desc="Epoch 0/{}".format(epochs))
+        pbar = tqdm(range(epochs*len(samples)//batch_size), desc="Epoch 0/{}".format(epochs), leave=True, position=0)
         moving_loss = 0.0
 
+        last_test_accuracy = 0.0
+        last_train_accuracy = 0.0
+
         for e in range(epochs):
+            random.shuffle(samples)
+
             for i in range(0, len(samples), batch_size):
                 batch = samples[i:i+batch_size]
                 
@@ -774,10 +790,10 @@ class LatentModule(torch.nn.Module):
                 if moving_loss != moving_loss:
                     moving_loss = -1.0
                 
-                pbar.set_description(f"Epoch {e+1}/{epochs}, loss={moving_loss:.4f}")
+                pbar.set_description(f"Epoch {e+1}/{epochs}, loss={moving_loss:.4f}" + " Loss: {:.4f}".format(moving_loss) + " Train accuracy: {:.2f}%".format(last_train_accuracy) + " Test accuracy: {:.2f}%".format(last_test_accuracy))
                 pbar.update(1)
             
-            if test is not None:
+            if test is not None and e % 2 == 0:
                 num_matches_test = 0
                 for i in range(0, len(test), batch_size):
                     num_matches_test += LatentModule.token_match(objective_fct(test[i:i+batch_size])).sum()
@@ -787,6 +803,13 @@ class LatentModule(torch.nn.Module):
                 for i in range(0, len(samples), batch_size):
                     num_matches_train += LatentModule.token_match(objective_fct(samples[i:i+batch_size])).sum()
                 train_accuracy = 100 * num_matches_train / len(samples)
-                print("Loss: {:.4f}".format(moving_loss), "Train accuracy: {:.2f}%".format(train_accuracy.item()), "Test accuracy: {:.2f}%".format(test_accuracy.item()))
+                
+                last_test_accuracy = test_accuracy.item()
+                last_train_accuracy = train_accuracy.item()
+
+            if epoch_callback is not None:
+                epoch_callback(e, last_train_accuracy, last_test_accuracy, moving_loss)
 
         pbar.close()
+
+        return last_train_accuracy, last_test_accuracy
