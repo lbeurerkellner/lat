@@ -13,7 +13,6 @@ def leftpadstack(tensors, padding_value=0):
         padding_value = torch.tensor(padding_value, device=tensors[0].device).view(1,1)
 
     for t in tensors:
-        padding = max_len - t.shape[0]
         padded_tensors += [torch.cat([padding_value] * (max_len - t.shape[0]) + [t], dim=0)]
         mask += [torch.cat([torch.zeros(max_len - t.shape[0], device=t.device), torch.ones(t.shape[0], device=t.device)], dim=0)]
     
@@ -57,21 +56,33 @@ class LatentLM:
         if type(prompt) is list:
             r = []
             for s in prompt:
+                # unpack single-element lists
+                if type(s) is list and len(s) == 1 and type(s[0]) is str:
+                    s = s[0]
+                
                 if len(r) > 0 and type(s) is str and type(r[-1]) is str:
                     r[-1] += s
                 else:
                     r += [s]
             return r
         else:
-            return prompt
+            return [prompt]
 
     def broadcast(self, prompt):
-        shapes = list(set([len(s) if type(s) is list else 1 for s in prompt]))
+        def determine_shape(e):
+            if type(e) is list:
+                return len(e)
+            elif type(e) is LatentTensor:
+                return e.shape[1]
+            else:
+                return 1
+        
+        shapes = list(set([determine_shape(e) for e in prompt]))
         
         if len(shapes) == 1:
             if shapes[0] == 1:
                 # all segments are singular
-                return [[self.consolidate_prompt(prompt)]]
+                return [self.consolidate_prompt(prompt)]
             else:
                 # pair all segments index-wise
                 return zip(*[prompt])
@@ -84,6 +95,8 @@ class LatentLM:
                 for segment in prompt:
                     if type(segment) is list:
                         pairing += [segment[i]]
+                    elif type(segment) is LatentTensor:
+                        pairing += [segment.item(i)]
                     else:
                         pairing += [segment]
                 pairings += [self.consolidate_prompt(pairing)]
@@ -97,42 +110,47 @@ class LatentLM:
         text = ""
         offset_mapping = []
         input_ids = []
-        first = True
 
-        for segment in prompt:
+        assert len(prompt) > 0, "You have to provide at least one prompt segment (string, input ID or latent input)"
+
+        i = 0
+
+        while i < len(prompt):
+            segment = prompt[i]
+            
             if type(segment) is str:
                 segment_text = segment
-                text += segment_text
                 encoded_inputs = self.tokenizer(segment_text, return_tensors='pt', return_offsets_mapping=True, add_special_tokens=False)
-                if first:
+                if i == 0:
                     offset_mapping += torch.cat([torch.tensor([[len(text),len(text)]], dtype=torch.int64), encoded_inputs['offset_mapping'][0] + len(text)])
                     segment_ids = [self.tokenizer.bos_token_id] + encoded_inputs['input_ids'].flatten().tolist()
                 else:
                     offset_mapping += encoded_inputs['offset_mapping'][0] + len(text)
                     segment_ids = encoded_inputs['input_ids'].flatten().tolist()
+                text += segment_text
                 input_ids += segment_ids
                 segment = self.embed_input_ids(torch.tensor(segment_ids, dtype=torch.int64, device=encoded_inputs['input_ids'].device))
                 inputs_embeds.append(segment)
             elif type(segment) is LatentTensor:
                 latent: LatentTensor = segment
                 latent_shp = latent.shape
-                assert len(latent_shp) == 3, "Expected latent of shape (layers,seq_len,hidden_size), but got {}".format(latent_shp)
-                assert latent_shp[0] == 1, "Expected latent of shape (1,seq_len,hidden_size), but got {}".format(latent_shp)
-                seq_len = latent_shp[1]
+                assert len(latent_shp) == 4, "Expected latent of shape (layers,batch_idx,seq_len,hidden_size), but got {}".format(latent_shp)
+                assert latent_shp[0] == 1 and latent_shp[1] == 1, "Expected latent of shape (1,1,seq_len,hidden_size), but got {}".format(latent_shp)
+                seq_len = latent_shp[2]
 
                 offset_begin = len(text)
                 
-                latent_repr = f"[{latent.names[0]}]"
+                latent_repr = f"{{{latent.names[0]}}}"
                 
                 text += latent_repr
                 input_ids += [latent] * seq_len
                 
                 offset_mapping += torch.tensor([[offset_begin, offset_begin + len(latent_repr)]] + [[0,0] for _ in range(seq_len - 1)], dtype=torch.int64)
-                inputs_embeds += [latent.hidden_states[0]]
+                inputs_embeds += [latent.hidden_states[0][0]]
             else:
-                raise ValueError("Expected prompt to be a string or a list of strings and tensors, but got {}".format(type(segment)))
+                raise ValueError("Expected prompt to be a string or a list of strings and tensors, but got {}: {}".format(type(segment), segment))
                 
-            first = False
+            i += 1
 
         inputs_embeds = torch.cat(inputs_embeds, dim=0)
         offset_mapping = torch.stack(offset_mapping, dim=0)
@@ -218,7 +236,7 @@ class LatentTensor:
         self.offset_mapping = offset_mapping
         self.attention_mask = attention_mask
         
-        self.names = names or [None] * len(hidden_states)
+        self.names = names or [None] * len(hidden_states[0])
 
     @property
     def shape(self):
@@ -238,6 +256,10 @@ class LatentTensor:
         prompts[1:] = [" " * len(title) + p for p in prompts[1:]]
 
         return title + "\n".join(prompts) + "\n"
+
+    @property
+    def device(self):
+        return self.hidden_states[0].device
 
     def __repr__(self):
         return str(self)
@@ -341,7 +363,7 @@ class LatentTensor:
             raise IndexError("Index {} out of range for LatentTensor of shape {}".format(idx, self.shape))
 
         hidden_states = self.hidden_states[idx].unsqueeze(0)
-        return LatentTensor(hidden_states, self.prompts, self.model, self.input_ids, self.offset_mapping, self.attention_mask, layer_idx=idx)
+        return LatentTensor(hidden_states, self.prompts, self.model, self.input_ids, self.offset_mapping, self.attention_mask, layer_idx=idx, names=self.names)
 
     def copy(self):
         return LatentTensor(self.hidden_states, self.prompts, self.model, self.input_ids, self.offset_mapping, self.attention_mask, names=self.names.copy(), layer_idx=self.layer_idx)
@@ -384,14 +406,55 @@ class LatentTensor:
         else:
             return self.distribution().exp().argmax(-1)
 
-    def complete(self, sample=False):
+    def complete(self, **kwargs):
         """
         Calls the model and returns the current sequence appended with the 
         discretized next token as new LatentTensor.
         """
-        # TODO: add key-value caching here
-        return self.model(self.discrete(sample=sample))
+        input_ids = self.input_ids.copy()
+        updated_input_ids = []
+        offsets = [(mask == 0).sum().item() for mask in self.attention_mask]
+        
+        for ids, next in zip(input_ids, self.next(**kwargs)):
+            updated_input_ids += [[*ids, next.item()]]
+
+        return self.model(self._model_inputs(updated_input_ids))
     
+    def _model_inputs(self, input_ids):
+        """
+        Derives the the sample-wise model inputs from the given input_ids, assuming
+        `input_ids == self.input_ids + [next_token]`
+
+        Uses self.prompts, self.offset_mapping 
+        """
+        model_inputs = []
+
+        for prompt, ids, offsets, mask in zip(self.prompts, input_ids, self.offset_mapping, self.attention_mask):
+            id_offset = (mask == 0).sum().item()
+            ids = ids[id_offset:]
+            offsets = offsets[id_offset:]
+            mask = mask[id_offset:]
+
+            text = decode(ids, self.model.tokenizer)
+            # add offset wrt. new extended text (includes next token)
+            offsets = torch.cat([offsets, torch.tensor([[len(prompt),len(text)]])], dim=0)
+
+            ti = 0
+            model_input = []
+            while ti < len(ids):
+                if type(ti) is LatentTensor:
+                    model_input += [ti]
+                else:
+                    start = offsets[ti][0]
+                    while ti+1 < len(ids) and type(ids[ti+1]) is not LatentTensor:
+                        ti +=1
+                    end = offsets[ti][1]
+                    model_input += [text[start:end]]
+                ti += 1
+            model_inputs += [model_input]
+        
+        return model_inputs
+
     def discrete(self, **kwargs) -> str:
         """
         Discritizes the current latent representation by sampling a next token from it
@@ -407,14 +470,19 @@ class LatentTensor:
         return [decode(uids[o:], self.model.tokenizer) for uids,o in zip(updated_input_ids, offsets)]
 
     def generate(self, max_tokens=32, sample=False):
-        assert self.layer_idx is not None, "Can only .generate() from a specific layer. Please first select a specific .layer(<N>) to compute the token distribution for."
+        # assert self.layer_idx is not None, "Can only .generate() from a specific layer. Please first select a specific .layer(<N>) to compute the token distribution for."
 
         x = self
         for _ in range(max_tokens):
             x = x.complete(sample=sample)
-            x = x.layer(self.layer_idx)
+            x = x.layer(self.layer_idx or -1)
         
         return x
+    
+    def __eq__(self, other):
+        if type(other) is not LatentTensor:
+            return False
+        return LatentEqualityObjective(self, other)
 
 # class Latent:
 #     """
@@ -633,7 +701,7 @@ def decode(input_ids, tokenizer, hide_eos=True):
 
     if type(input_ids[0]) is LatentTensor:
         latent = input_ids[0]
-        return f"[{latent.names[0]}]" + decode(input_ids[1:], tokenizer)
+        return f"{{{latent.names[0]}}}" + decode(input_ids[1:], tokenizer)
 
     i = 0
     while i + 1 < len(input_ids) and type(input_ids[i+1]) is not LatentTensor:
@@ -654,9 +722,9 @@ class LatentModule(torch.nn.Module):
         super().__init__()
 
     def __call__(self, latent: LatentTensor, *args, **kwargs) -> LatentTensor:
-        x = self.forward(latent.hidden_states[-1], *args, **kwargs)
+        x = self.forward(latent.hidden_states[-1], *args, **kwargs).unsqueeze(0)
         names = [f"{self.name}({n})" for n in latent.names]
-        return LatentTensor(x, latent.prompts, latent.model, latent.input_ids, latent.offset_mapping, latent.attention_mask, names=names, layer_idx=latent.layer_idx)
+        return LatentTensor(x, latent.prompts, latent.model, latent.input_ids, latent.offset_mapping, latent.attention_mask, names=names, layer_idx=latent.layer_idx or 0)
     
     @staticmethod
     def loss(objective: LatentEqualityObjective, loss_fct="cosine"):
@@ -665,19 +733,20 @@ class LatentModule(torch.nn.Module):
         """
         assert len(objective.latents) == 2, "Expected exactly 2 latents, but got {}".format(len(objective.latents))
         
-        device = objective.latents[0].activations.device
+        device = objective.latents[0].device
         loss = torch.tensor(0.0, device=device)
 
         if "mse" in loss_fct.lower():
-            loss += torch.nn.MSELoss()(objective.latents[0].activations, objective.latents[1].activations)
+            for l,r in zip(objective.latents[0].hidden_states, objective.latents[1].hidden_states):
+                loss += torch.nn.MSELoss()(l, r)
         
         if "cosine" in loss_fct.lower():
             # print shapes
-            loss += 1 - torch.nn.functional.cosine_similarity(objective.latents[0].activations.unsqueeze(0), objective.latents[1].activations.unsqueeze(0)).mean()
+            loss += 1 - torch.nn.functional.cosine_similarity(objective.latents[0].hidden_states.unsqueeze(0), objective.latents[1].hidden_states.unsqueeze(0)).mean()
 
         if "crossentropy" in loss_fct.lower():
-            target = torch.tensor(objective.latents[1].next(), device=device).unsqueeze(0)
-            loss += torch.nn.CrossEntropyLoss()(objective.latents[0].distribution().unsqueeze(0), target)
+            target = objective.latents[1].next().clone().detach()
+            loss += torch.nn.CrossEntropyLoss()(objective.latents[0].distribution(), target)
 
         return loss
 
@@ -685,16 +754,18 @@ class LatentModule(torch.nn.Module):
         assert len(objective.latents) == 2, "Expected exactly 2 latents, but got {}".format(len(objective.latents))
         return objective.latents[0].next(**kwargs) == objective.latents[1].next(**kwargs)
 
-    def fit(self, objective_fct, samples, loss_fct="cosine", epochs=1, lr=0.01, test=None, **kwargs):
+    def fit(self, objective_fct, samples, loss_fct="cosine", epochs=1, lr=0.01, test=None, batch_size=8, **kwargs):
         optimizer = torch.optim.Adam(self.parameters(), lr=lr, **kwargs)
         
-        pbar = tqdm(range(epochs*len(samples)), desc="Epoch", position=0, leave=True)
+        pbar = tqdm(range(epochs*len(samples)//batch_size), desc="Epoch 0/{}".format(epochs))
         moving_loss = 0.0
 
         for e in range(epochs):
-            for s in samples:
+            for i in range(0, len(samples), batch_size):
+                batch = samples[i:i+batch_size]
+                
                 optimizer.zero_grad()
-                loss = LatentModule.loss(objective_fct(s), loss_fct=loss_fct)
+                loss = LatentModule.loss(objective_fct(batch), loss_fct=loss_fct)
                 loss.backward()
                 optimizer.step()
 
@@ -708,14 +779,14 @@ class LatentModule(torch.nn.Module):
             
             if test is not None:
                 num_matches_test = 0
-                for s in test:
-                    num_matches_test += LatentModule.token_match(objective_fct(s))
+                for i in range(0, len(test), batch_size):
+                    num_matches_test += LatentModule.token_match(objective_fct(test[i:i+batch_size])).sum()
                 test_accuracy = 100 * num_matches_test / len(test)
 
                 num_matches_train = 0
-                for s in samples:
-                    num_matches_train += LatentModule.token_match(objective_fct(s))
+                for i in range(0, len(samples), batch_size):
+                    num_matches_train += LatentModule.token_match(objective_fct(samples[i:i+batch_size])).sum()
                 train_accuracy = 100 * num_matches_train / len(samples)
-                print("Loss: {:.4f}".format(moving_loss), "Train accuracy: {:.2f}%".format(train_accuracy), "Test accuracy: {:.2f}%".format(test_accuracy))
+                print("Loss: {:.4f}".format(moving_loss), "Train accuracy: {:.2f}%".format(train_accuracy.item()), "Test accuracy: {:.2f}%".format(test_accuracy.item()))
 
         pbar.close()
